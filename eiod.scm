@@ -1,5 +1,5 @@
 ;; eiod.scm: eval-in-one-define
-;; $Id$
+;; $Id: eiod.scm,v 1.14 2004/09/28 01:04:24 al Exp al $
 
 ;; A minimal implementation of r5rs eval, null-environment, and
 ;; scheme-report-environment.
@@ -160,13 +160,22 @@
 
 (define null-environment
   (let ()
-    (define (syntax-rules** id? new-id top-env ellipsis)
-      (lambda (mac-env pat-literals rules)
+    ;; Syntax-rules is implemented as a macro that expands into a call
+    ;; to the syntax-rules* procedure.  The arguments to syntax-rules*
+    ;; are the arguments to syntax-rules plus the current environment,
+    ;; which is captured with get-env.  Syntax-rules** is called once
+    ;; with some basics from the top-level environment: it creates and
+    ;; returns syntax-rules*.
+    (define (syntax-rules** id? new-id denotation-of-default-ellipsis)
+      (define (syntax-rules* mac-env ellipsis pat-literals rules)
         (define (pat-literal? id)     (memq id pat-literals))
 	(define (not-pat-literal? id) (not (pat-literal? id)))
-	(define (ellipsis? x)         (and (id? x) (eq? (mac-env x)
-							(top-env ellipsis))))
 	(define (ellipsis-pair? x)    (and (pair? x) (ellipsis? (car x))))
+	(define (ellipsis? x)
+	  (and (id? x)
+	       (if ellipsis
+		   (eq? x ellipsis)
+		   (eq? (mac-env x) denotation-of-default-ellipsis))))
 
 	;; List-ids returns a list of the non-ellipsis ids in a
 	;; pattern or template for which (pred? id) is true.  If
@@ -248,7 +257,8 @@
 	    (let* ((rule (car rules)) (pat (car rule)) (tmpl (cadr rule)))
 	      (cond ((match-pattern pat use env) =>
 		     (lambda (bindings) (expand-template pat tmpl bindings)))
-		    (else (loop (cdr rules)))))))))
+		    (else (loop (cdr rules))))))))
+      syntax-rules*)
     (define macro-defs
       '((define-syntax quote
 	  (syntax-rules ()
@@ -344,12 +354,14 @@
       ((eval `(lambda (cons append list->vector memv delay* if* syntax-rules**)
 		((lambda (syntax-rules*)
 		   (define-syntax syntax-rules
-		     (syntax-rules* (get-env) (syntax ())
-		       (syntax (((_ lits . rules)
-				 (syntax-rules* (get-env) (syntax lits)
-				   (syntax rules)))))))
+		     (syntax-rules* (get-env) #f (syntax ())
+		       (syntax (((_ (lit ...) . rules)
+				 (syntax-rules #f (lit ...) . rules))
+				((_ ellipsis lits . rules)
+				 (syntax-rules* (get-env) (syntax ellipsis)
+				   (syntax lits) (syntax rules)))))))
 		   ((lambda () ,@macro-defs (get-env))))
-		 (syntax-rules** id? new-id (get-env) (syntax ...))))
+		 (syntax-rules** id? new-id ((get-env) (syntax ...)))))
 	     #f)
        cons append list->vector memv delay* if* syntax-rules**))
     (define promise (delay (null-env)))
@@ -541,7 +553,16 @@
 			       (let-syntax ((f (syntax-rules () ((_) 'x))))
 				 (f)))))))
 	(f))
-      x))))
+      x)
+     ((let-syntax
+	  ((f (syntax-rules ()
+		((f e a ...)
+		 (let-syntax
+		     ((g (syntax-rules ::: ()
+			   ((g n :::) '((a e n :::) ...)))))
+		   (g 1 2 3))))))
+	(f ::: x y z))
+      ((x ::: 1 2 3) (y ::: 1 2 3) (z ::: 1 2 3))))))
 
 ;; matching close paren for quote-and-evaluate at beginning of file.
 ) 
