@@ -1,5 +1,6 @@
 ;; eiod.scm: eval-in-one-define
 ;; Copyright 2002 Al Petrofsky <al@petrofsky.org>
+;; $Id$
 ;;
 ;; A minimal implementation of r5rs eval, null-environment, and
 ;; scheme-report-environment.
@@ -7,30 +8,46 @@
 ;; Data Structures:
 
 ;; An environment is a procedure that takes an identifier and returns
-;; a binding.  A binding is either a mutable pair of an identifier and
-;; its value, or, for identifiers with no true binding, it is a symbol
-;; that represents the identifier's original name.
+;; a denotation.  A denotation is either a binding, or, for unbound
+;; identifiers, it is a symbol that represents the identifier's
+;; original name.  A binding is a mutable pair of an identifier and
+;; its value.
 
-;; binding:      [symbol | (identifier . [value | special-form])]
-;; special-form: ([builtin | transformer] . marker)
-;; identifier:   [symbol | (binding . marker)]
+;; denotation:  [symbol | binding]
+;; binding:     (identifier . [value | syntax])
+;; syntax:      ([builtin | transformer] . marker)
+;; identifier:  [symbol | (denotation . marker)]
 
-;; A value is any arbitrary scheme value.  Special forms are stored in
-;; pairs whose cdr is the eq?-unique marker object (this makes them
-;; distinguishable from ordinary pair values in a variable binding).
-;; The car is either a symbol naming a builtin, or a transformer
-;; procedure that takes two arguments: a macro use and the environment
-;; of the macro use.
+;; A value is any arbitrary scheme value.  Syntaxes (special forms)
+;; are stored in pairs whose cdr is the eq?-unique marker object (this
+;; makes them distinguishable from ordinary pair values in a variable
+;; binding).  The car is either a symbol naming a builtin, or a
+;; transformer procedure that takes two arguments: a macro use and the
+;; environment of the macro use.
 
-;; When a template containing a literal identifier is expanded, the
-;; identifier is replaced with a fresh identifier, which is a new pair
-;; whose cdr is the marker object (which makes such identifiers
+;; When a macro template containing a literal identifier is expanded,
+;; the identifier is replaced with a fresh identifier, which is a new
+;; pair whose cdr is the marker object (which makes such identifiers
 ;; distinguishable from ordinary pairs in a source-code s-expression).
-;; The car is the old identifier's binding in the environment of the
-;; macro's definition.
+;; The fresh identifier's car is the old identifier's denotation in
+;; the environment of the macro's definition.  When one of these
+;; "renamed" identifiers is lookep up in an environment that has no
+;; binding for it, the old denotation is returned.
 
-;; This environment and identifier model is similar to the one
+;; This environment and denotation model is similar to the one
 ;; described in the 1991 paper "Macros that Work" by Clinger and Rees.
+
+;; The base environment contains eight syntax bindings and two
+;; variable bindings:
+;;   lambda, set!, and begin are as in the standard.
+;;   q is like quote, but it does not handle pairs or vectors.
+;;   def is like define, but it does not handle the (f . args) format.
+;;   (get-env) returns the local environment.
+;;   (syntax x) is like quote, but does not convert identifiers to symbols.
+;;   (macro x) evaluates x to get a transformer procedure and makes a macro.
+;;   The id? procedure is a predicate for identifiers.
+;;   The new-id procedure takes a denotation and returns a fresh identifier.
+
 
 ;; Quote-and-evaluate captures all the code into the list eiod-source
 ;; so that we can feed eval to itself.  The matching close parenthesis
@@ -47,19 +64,13 @@
     (define (mark x)    (cons x marker))
     (define unmark      car)
     (define (marked? x) (and (pair? x) (eq? marker (cdr x))))
+    (define (id? sexp)  (or (symbol? sexp) (marked? sexp)))
 
-    (define (id? sexp)    (or (symbol? sexp) (marked? sexp)))
-    (define (spair? sexp) (and (pair? sexp) (not (marked? sexp))))
-
-    (define (ids->syms sexp)
-      (cond ((id? sexp) (let loop ((x sexp)) (if (pair? x) (loop (car x)) x)))
-	    ((pair? sexp) (cons (ids->syms (car sexp)) (ids->syms (cdr sexp))))
-	    ((vector? sexp) (list->vector (ids->syms (vector->list sexp))))
-	    (else sexp)))
-    
     (define (make-builtins-env)
-      (define l '(lambda quote set! syntax-rules begin builtin-define get-env))
-      (let ((alist (map cons l (map mark l))))
+      (define syntaxes '(lambda set! q def begin syntax macro get-env))
+      (let ((alist `((id? . ,id?)
+		     (new-id . ,mark)
+		     . ,(map cons syntaxes (map mark syntaxes)))))
 	(lambda (id) (or (assq id alist) (if (symbol? id) id (unmark id))))))
 
     (define (env-add id val env)
@@ -69,18 +80,20 @@
     (define (xeval sexp env)
       (let eval-in-this-env ((sexp sexp))
 	(cond ((id? sexp) (cdr (env sexp)))
-	      ((not (spair? sexp)) sexp)
+	      ((not (pair? sexp)) sexp)
 	      (else (let ((head (eval-in-this-env (car sexp)))
 			  (tail (cdr sexp)))
 		      (if (marked? head)
 			  (case (unmark head)
 			    ((get-env) env)
-			    ((quote) (ids->syms (car tail)))
-			    ((begin) (eval-begin tail env))
+			    ((syntax) (car tail))
 			    ((lambda) (eval-lambda tail env))
+			    ((begin) (eval-begin tail env))
+			    ((macro) (mark (eval-in-this-env (car tail))))
 			    ((set!) (set-cdr! (env (car tail))
 					      (eval-in-this-env (cadr tail))))
-			    ((syntax-rules) (eval-syntax-rules tail env))
+			    ((q) (do ((x tail (car x)))
+				     ((not (pair? x)) x)))
 			    (else (eval-in-this-env ((unmark head) sexp env))))
 			  (apply head (map eval-in-this-env tail))))))))
 
@@ -95,123 +108,24 @@
 	(define ienv (do ((args args (cdr args))
 			  (vars (car tail) (cdr vars))
 			  (ienv env (env-add (car vars) (car args) ienv)))
-			 ((not (spair? vars))
+			 ((or (null? vars) (id? vars))
 			  (if (null? vars) ienv (env-add vars args ienv)))))
-	(let loop ((ienv ienv) (defs '()) (body (cdr tail)))
+	(let loop ((ienv ienv) (vars '()) (inits '()) (body (cdr tail)))
+	  (define (ieval sexp) (xeval sexp ienv))
 	  (let ((first (car body)) (rest (cdr body)))
-	    (let* ((head (and (spair? first) (car first)))
+	    (let* ((head (and (pair? first) (not (id? first)) (car first)))
 		   (head-val (and (id? head) (cdr (ienv head))))
 		   (special (and (marked? head-val) (unmark head-val))))
 	      (if (procedure? special)
-		  (loop ienv defs (cons (special first ienv) rest))
+		  (loop ienv vars inits (cons (special first ienv) rest))
 		  (case special
-		    ((begin) (loop ienv defs (append (cdr first) rest)))
-		    ((builtin-define)
-		     (loop (env-add (cadr first) 'undefined ienv)
-			   (cons (cdr first) defs)
-			   rest))
-		    (else (for-each set-cdr!
-				    (map ienv (map car defs))
-				    (map (lambda (def) (xeval (cadr def) ienv))
-					 defs))
+		    ((begin) (loop ienv vars inits (append (cdr first) rest)))
+		    ((def) (loop (env-add (cadr first) 'undefined ienv)
+				 (cons (cadr first) vars)
+				 (cons (caddr first) inits)
+				 rest))
+		    (else (for-each set-cdr! (map ienv vars) (map ieval inits))
 			  (eval-begin body ienv)))))))))
-
-    (define (eval-syntax-rules mac-tail mac-env)
-      (define literals (car mac-tail))
-      (define rules    (cdr mac-tail))
-
-      (define (pat-literal? id)     (memq id literals))
-      (define (not-pat-literal? id) (not (pat-literal? id)))
-
-      (define (ellipsis? x)      (and (id? x) (eq? '... (mac-env x))))
-      (define (ellipsis-pair? x) (and (spair? x) (ellipsis? (car x))))
-
-      ;; List-ids returns a list of those ids in a pattern or template
-      ;; for which (pred? id) is true.  If include-scalars is false, we
-      ;; only include ids that are within the scope of at least one
-      ;; ellipsis.
-      (define (list-ids x include-scalars pred?)
-	(let collect ((x x) (inc include-scalars) (l '()))
-	  (cond ((vector? x) (collect (vector->list x) inc l))
-		((id? x) (if (and inc (pred? x)) (cons x l) l))
-		((spair? x) (if (ellipsis-pair? (cdr x))
-				(collect (car x) #t (collect (cddr x) inc l))
-				(collect (car x) inc (collect (cdr x) inc l))))
-		(else l))))
-    
-      ;; Returns #f or an alist mapping each pattern var to a part of
-      ;; the input.  Ellipsis vars are mapped to lists of parts (or
-      ;; lists of lists...).
-      (define (match-pattern pat use env)
-	(call-with-current-continuation
-	 (lambda (return)
-	   (define (fail) (return #f))
-	   (let match ((pat (cdr pat)) (sexp (cdr use)) (bindings '()))
-	     (define (continue-if condition) (if condition bindings (fail)))
-	     (cond
-	      ((id? pat)
-	       (if (pat-literal? pat)
-		   (continue-if (and (id? sexp) (eq? (mac-env pat)
-						     (env sexp))))
-		   (cons (cons pat sexp) bindings)))
-	      ((vector? pat)
-	       (or (vector? sexp) (fail))
-	       (match (vector->list pat) (vector->list sexp) bindings))
-	      ((not (spair? pat))
-	       (continue-if (equal? pat sexp)))
-	      ((ellipsis-pair? (cdr pat))
-	       (or (list? sexp) (fail))
-	       (append (apply map list (list-ids pat #t not-pat-literal?)
-			      (map (lambda (x)
-				     (map cdr (match (car pat) x '())))
-				   sexp))
-		       bindings))
-	      ((spair? sexp)
-	       (match (car pat) (car sexp)
-		      (match (cdr pat) (cdr sexp) bindings)))
-	      (else (fail)))))))
-
-      (define (expand-template pat tmpl top-bindings)
-	(define ellipsis-vars (list-ids (cdr pat) #f not-pat-literal?))
-	(define (list-ellipsis-vars subtmpl)
-	  (list-ids subtmpl #t (lambda (id) (memq id ellipsis-vars))))
-	;; New-literals is an alist mapping each literal id in the
-	;; template to a fresh id for inserting into the output.  It
-	;; might have duplicate entries mapping an id to two different
-	;; fresh ids, but that's okay because when we go to retrieve a
-	;; fresh id, assq will always retrieve the first one.
-	(define new-literals
-	  (map (lambda (id) (cons id (mark (mac-env id))))
-	       (list-ids tmpl #t (lambda (id) (not (assq id top-bindings))))))
-	(let expand ((tmpl tmpl) (bindings top-bindings))
-	  (let expand-part ((tmpl tmpl))
-	    (cond
-	     ((id? tmpl) (cdr (or (assq tmpl bindings)
-				  (assq tmpl top-bindings)
-				  (assq tmpl new-literals))))
-	     ((vector? tmpl) (list->vector (expand-part (vector->list tmpl))))
-	     ((spair? tmpl)
-	      (if (ellipsis-pair? (cdr tmpl))
-		  (let ((vars-to-iterate (list-ellipsis-vars (car tmpl))))
-		    (append (apply map
-				   (lambda vals
-				     (expand (car tmpl)
-					     (map cons vars-to-iterate vals)))
-				   (map (lambda (var)
-					  (cdr (assq var bindings)))
-					vars-to-iterate))
-			    (expand-part (cddr tmpl))))
-		  (cons (expand-part (car tmpl)) (expand-part (cdr tmpl)))))
-	     (else tmpl)))))
-
-      (mark (lambda (use env)
-	      (let loop ((rules rules))
-		(define rule (car rules))
-		(let ((pat (car rule)) (tmpl (cadr rule)))
-		  (define bindings (match-pattern pat use env))
-		  (if bindings
-		      (expand-template pat tmpl bindings)
-		      (loop (cdr rules))))))))
 
     ;; We make a copy of the initial input to ensure that subsequent
     ;; mutation of it does not affect eval's result. [1]
@@ -226,8 +140,105 @@
 
 (define null-environment
   (let ()
+    (define (syntax-rules** id? new-id top-env ellipsis)
+      (lambda (mac-env pat-literals rules)
+        (define (pat-literal? id)     (memq id pat-literals))
+	(define (not-pat-literal? id) (not (pat-literal? id)))
+	(define (spair? x)            (and (pair? x) (not (id? x))))
+	(define (ellipsis? x)         (and (id? x) (eq? (mac-env x)
+							(top-env ellipsis))))
+	(define (ellipsis-pair? x)    (and (spair? x) (ellipsis? (car x))))
+
+	;; List-ids returns a list of the non-ellipsis ids in a
+	;; pattern or template for which (pred? id) is true.  If
+	;; include-scalars is false, we only include ids that are
+	;; within the scope of at least one ellipsis.
+	(define (list-ids x include-scalars pred?)
+	  (let collect ((x x) (inc include-scalars) (l '()))
+	    (cond ((id? x) (if (and inc (pred? x)) (cons x l) l))
+		  ((vector? x) (collect (vector->list x) inc l))
+		  ((pair? x)
+		   (if (ellipsis-pair? (cdr x))
+		       (collect (car x) #t (collect (cddr x) inc l))
+		       (collect (car x) inc (collect (cdr x) inc l))))
+		  (else l))))
+    
+	;; Returns #f or an alist mapping each pattern var to a part of
+	;; the input.  Ellipsis vars are mapped to lists of parts (or
+	;; lists of lists...).
+	(define (match-pattern pat use env)
+	  (call-with-current-continuation
+	    (lambda (return)
+	      (define (fail) (return #f))
+	      (let match ((pat (cdr pat)) (sexp (cdr use)) (bindings '()))
+		(define (continue-if condition) (if condition bindings (fail)))
+		(cond
+		 ((id? pat) (if (pat-literal? pat)
+				(continue-if (and (id? sexp) (eq? (mac-env pat)
+								  (env sexp))))
+				(cons (cons pat sexp) bindings)))
+		 ((id? sexp) (fail))
+		 ((vector? pat)
+		  (or (vector? sexp) (fail))
+		  (match (vector->list pat) (vector->list sexp) bindings))
+		 ((not (pair? pat)) (continue-if (equal? pat sexp)))
+		 ((ellipsis-pair? (cdr pat))
+		  (let slist? ((x sexp))
+		    (or (null? x) (if (spair? x) (slist? (cdr x)) (fail))))
+		  (let ((vars (list-ids pat #t not-pat-literal?)))
+		    (define (match1 sexp) (map cdr (match (car pat) sexp '())))
+		    (append (apply map list vars (map match1 sexp))
+			    bindings)))
+		 ((pair? sexp) (match (car pat) (car sexp)
+				      (match (cdr pat) (cdr sexp) bindings)))
+		 (else (fail)))))))
+
+	(define (expand-template pat tmpl top-bindings)
+	  ;; New-literals is an alist mapping each literal id in the
+	  ;; template to a fresh id for inserting into the output.  It
+	  ;; might have duplicate entries mapping an id to two different
+	  ;; fresh ids, but that's okay because when we go to retrieve a
+	  ;; fresh id, assq will always retrieve the first one.
+	  (define new-literals
+	    (map (lambda (id) (cons id (new-id (mac-env id))))
+		 (list-ids tmpl #t (lambda (id)
+				     (not (assq id top-bindings))))))
+	  (define ellipsis-vars (list-ids (cdr pat) #f not-pat-literal?))
+	  (define (list-ellipsis-vars subtmpl)
+	    (list-ids subtmpl #t (lambda (id) (memq id ellipsis-vars))))
+	  (let expand ((tmpl tmpl) (bindings top-bindings))
+	    (let expand-part ((tmpl tmpl))
+	      (cond
+	       ((id? tmpl) (cdr (or (assq tmpl bindings)
+				    (assq tmpl top-bindings)
+				    (assq tmpl new-literals))))
+	       ((vector? tmpl)
+		(list->vector (expand-part (vector->list tmpl))))
+	       ((pair? tmpl)
+		(if (ellipsis-pair? (cdr tmpl))
+		    (let ((vars-to-iterate (list-ellipsis-vars (car tmpl))))
+		      (define (lookup var) (cdr (assq var bindings)))
+		      (define (expand-car . vals)
+			(expand (car tmpl) (map cons vars-to-iterate vals)))
+		      (append (apply map expand-car
+				     (map lookup vars-to-iterate))
+			      (expand-part (cddr tmpl))))
+		    (cons (expand-part (car tmpl)) (expand-part (cdr tmpl)))))
+	       (else tmpl)))))
+
+	(lambda (use env)
+	  (let loop ((rules rules))
+	    (let* ((rule (car rules)) (pat (car rule)) (tmpl (cadr rule)))
+	      (cond ((match-pattern pat use env) =>
+		     (lambda (bindings) (expand-template pat tmpl bindings)))
+		    (else (loop (cdr rules)))))))))
     (define macro-defs
-      '((define-syntax quasiquote
+      '((define-syntax quote
+	  (syntax-rules ()
+	    ('(x . y) (cons 'x 'y))
+	    ('#(x ...) (list->vector '(x ...)))
+	    ('x (q x))))
+	(define-syntax quasiquote
 	  (syntax-rules (unquote unquote-splicing quasiquote)
 	    (`,x x)
 	    (`(,@x . y) (append x `y))
@@ -249,7 +260,7 @@
 	(define-syntax letrec
 	  (syntax-rules ()
 	    ((_ ((var init) ...) . body)
-	     (let () (builtin-define var init) ... (let () . body)))))
+	     (let () (def var init) ... (let () . body)))))
 	(define-syntax let*
 	  (syntax-rules ()
 	    ((_ () . body) (let () . body))
@@ -295,7 +306,7 @@
 	  (syntax-rules ()
 	    ((_ (var . args) . body)
 	     (define var (lambda args . body)))
-	    ((_ var init) (builtin-define var init))))
+	    ((_ var init) (def var init))))
 	(define-syntax if
 	  (syntax-rules () ((_ x y ...) (if* x (lambda () y) ...))))
 	(define-syntax delay
@@ -303,14 +314,26 @@
     (define (if* a b . c) (if a (b) (if (pair? c) ((car c)))))
     (define (delay* thunk) (delay (thunk)))
     (define (null-env)
-      ((eval `(lambda (cons append list->vector memv delay* if*)
-		((lambda (define-syntax)
-		   ,@macro-defs
-		   (let ((let-syntax let) (letrec-syntax letrec))
-		     (get-env)))
-		 builtin-define))
+      ((eval `(lambda (cons append list->vector memv delay* if* syntax-rules**)
+		(def syntax-rules*
+		     (syntax-rules** id? new-id (get-env) (syntax ...)))
+		(def define-syntax def)
+		((lambda ()
+		   (define-syntax syntax-rules
+		     (macro (syntax-rules*
+			      (get-env)
+			      (syntax ())
+			      (syntax (((_ lits . rules)
+					(macro (syntax-rules*
+						 (get-env)
+						 (syntax lits)
+						 (syntax rules)))))))))
+		   ((lambda ()
+		      ,@macro-defs
+		      (let ((let-syntax let) (letrec-syntax letrec))
+			(get-env)))))))
 	     #f)
-       cons append list->vector memv delay* if*))
+       cons append list->vector memv delay* if* syntax-rules**))
     (define promise (delay (null-env)))
     (lambda (version)
       (if (= version 5)
