@@ -1,10 +1,10 @@
 ;; eiod.scm: eval-in-one-define
-;; $Id: eiod.scm,v 1.15 2004/09/28 06:08:10 al Exp al $
+;; $Id: eiod.scm,v 1.16 2004/10/29 21:06:51 al Exp al $
 
 ;; A minimal implementation of r5rs eval, null-environment, and
 ;; scheme-report-environment.  (And SRFI-46 extensions, too.)
 
-;; Copyright 2002, 2004 Al Petrofsky <al@petrofsky.org>
+;; Copyright 2002, 2004, 2005 Al Petrofsky <al@petrofsky.org>
 
 ;; You may redistribute and/or modify this software under the terms of
 ;; the GNU General Public License as published by the Free Software
@@ -155,8 +155,8 @@
 			    (ienv (adder id 'undefined ienv)))
 		       (loop ienv (cons id ids) (cons init inits) rest))))
 		  (else (let ((ieval (lambda (init) (eval init ienv))))
-			  (for-each set-val! (map ienv ids) (map ieval inits)))
-			(eval-seq body ienv)))))))))
+			  (for-each set-val! (map ienv ids) (map1 ieval inits))
+			  (eval-seq body ienv))))))))))
 
   ;; We make a copy of the initial input to ensure that subsequent
   ;; mutation of it does not affect eval's result. [1]
