@@ -6,19 +6,22 @@
 
 ;; Data Structures:
 
-;; An enivronment is an alist:
+;; An environment is an alist:
 
-;; environment: ((identifier . [value | macro]) ...)
-;; macro: (macro-marker . procedure)
+;; environment:    (proper-binding ...)
+;; proper-binding: (identifier . [value | macro])
+;; macro:          (procedure . marker)
 
-;; A value is any arbitrary scheme value.  Macros are stored in lists
-;; whose car is the eq?-unique macro-marker object.
+;; A value is any arbitrary scheme value.  Macros are stored in pairs
+;; whose cdr is the eq?-unique marker object.
 
-;; identifier: symbol or (id-marker environment identifier)
+;; identifier: [symbol | (binding . marker)]
+;; binding:    [symbol | proper-binding]
 
 ;; When a template containing a literal identifier is expanded, the
-;; environment of the transformer is added to the identifier, along
-;; with the eq?-unique id-marker object.
+;; identifier is replaced with a new pair containing the marker object
+;; and the binding of the literal in the environment of the macro (or
+;; the plain symbol if there is no binding).
 
 ;; Quote-and-evaluate captures all the code into the list eiod-source
 ;; so that we can feed eval to itself.  The matching close parenthesis
@@ -31,36 +34,52 @@
 
 (define eval
   (let ()
-    (define id-marker       (list '*id-marker*))
-    (define (new-id env id) (list id-marker env id))
-    (define id-env          cadr)
-    (define id-prev         caddr)
-    (define (id->sym id)    (if (symbol? id) id (id->sym (id-prev id))))
-    (define (id? sexp)      (or (symbol? sexp)
-			        (and (pair? sexp) (eq? id-marker (car sexp)))))
-    (define (spair? sexp)   (and (pair? sexp) (not (id? sexp))))
-    (define (slist? sexp)   (or (null? sexp)
-			        (and (spair? sexp) (slist? (cdr sexp)))))
+    (define marker      (vector '*eval-marker*))
+    (define (mark x)    (cons x marker))
+    (define unmark      car)
+    (define (marked? x) (and (pair? x) (eq? marker (cdr x))))
+
+    (define (id? sexp)    (or (symbol? sexp) (marked? sexp)))
+    (define (spair? sexp) (and (pair? sexp) (not (marked? sexp))))
 
     (define (ids->syms sexp)
-      (cond ((id? sexp)     (id->sym sexp))
-	    ((pair? sexp)   (cons (ids->syms (car sexp))
-				  (ids->syms (cdr sexp))))
+      (cond ((id? sexp) (let loop ((x sexp)) (if (pair? x) (loop (car x)) x)))
+	    ((pair? sexp) (cons (ids->syms (car sexp)) (ids->syms (cdr sexp))))
 	    ((vector? sexp) (list->vector (ids->syms (vector->list sexp))))
-	    (else           sexp)))
-
-    (define macro-marker     (list '*macro-marker*))
-    (define (new-macro proc) (cons macro-marker proc))
-    (define macro-proc       cdr)
-    (define (vmacro? val)    (and (pair? val) (eq? macro-marker (car val))))
+	    (else sexp)))
+    
+    (define (lookup id env)
+      (or (assq id env) (if (symbol? id) id (unmark id))))
 
     (define (acons key val alist) (cons (cons key val) alist))
 
-    (define (lookup id env)
-      (or (assq id env)
-	  (if (symbol? id)
-	      id
-	      (lookup (id-prev id) (id-env id)))))
+    (define (xeval sexp env)
+      (let eval-in-this-env ((sexp sexp))
+	(cond ((id? sexp) (cdr (lookup sexp env)))
+	      ((not (spair? sexp)) sexp)
+	      (else
+	       (let ((head (car sexp)) (tail (cdr sexp)))
+		 (let ((binding (and (id? head) (lookup head env))))
+		   (case binding
+		     ((get-env) env)
+		     ((quote)   (ids->syms (car tail)))
+		     ((begin)   (eval-begin tail env))
+		     ((lambda)  (eval-lambda tail env))
+		     ((set!)    (set-cdr! (lookup (car tail) env)
+					  (eval-in-this-env (cadr tail))))
+		     ((syntax-rules) (eval-syntax-rules tail env))
+		     (else (let ((val (and binding (cdr binding))))
+			     (if (marked? val)
+				 (eval-in-this-env ((unmark val) tail env))
+				 (apply (eval-in-this-env head)
+					(map eval-in-this-env tail))))))))))))
+
+    (define (eval-begin tail env)
+      ;; Don't use for-each because we must tail-call the last expression.
+      (do ((sexp1 (car tail) (car sexps))
+	   (sexps (cdr tail) (cdr sexps)))
+	  ((null? sexps) (xeval sexp1 env))
+	(xeval sexp1 env)))
 
     (define (eval-lambda tail env)
       (lambda args
@@ -87,37 +106,9 @@
 				      (cons (cadr tail) inits)
 				      rest))
 		      (else (let ((val (and (pair? binding) (cdr binding))))
-			      (if (vmacro? val)
-				  (retry ((macro-proc val) tail ienv))
+			      (if (marked? val)
+				  (retry ((unmark val) tail ienv))
 				  (finish))))))))))))
-
-    (define (eval-begin tail env)
-      ;; Don't use for-each because we must tail-call the last expression.
-      (do ((sexp1 (car tail) (car sexps))
-	   (sexps (cdr tail) (cdr sexps)))
-	  ((null? sexps) (xeval sexp1 env))
-	(xeval sexp1 env)))
-
-    (define (xeval sexp env)
-      (let eval-in-this-env ((sexp sexp))
-	(cond ((id? sexp) (cdr (lookup sexp env)))
-	      ((not (spair? sexp)) sexp)
-	      (else
-	       (let ((head (car sexp)) (tail (cdr sexp)))
-		 (let ((binding (and (id? head) (lookup head env))))
-		   (case binding
-		     ((get-env) env)
-		     ((quote)   (ids->syms (car tail)))
-		     ((begin)   (eval-begin tail env))
-		     ((lambda)  (eval-lambda tail env))
-		     ((set!)    (set-cdr! (lookup (car tail) env)
-					  (eval-in-this-env (cadr tail))))
-		     ((syntax-rules) (eval-syntax-rules tail env))
-		     (else (let ((val (and binding (cdr binding))))
-			     (if (vmacro? val)
-				 (eval-in-this-env ((macro-proc val) tail env))
-				 (apply (eval-in-this-env head)
-					(map eval-in-this-env tail))))))))))))
 
     (define (eval-syntax-rules mac-tail mac-env)
       (define literals (car mac-tail))
@@ -167,7 +158,7 @@
 	      ((not (spair? pat))
 	       (continue-if (equal? pat sexp)))
 	      ((ellipsis-pair? (cdr pat))
-	       (or (slist? sexp) (fail))
+	       (or (list? sexp) (fail))
 	       (append (apply map list (list-ids pat #t not-pat-literal?)
 			      (map (lambda (x)
 				     (map cdr (match (car pat) x '())))
@@ -188,7 +179,7 @@
 	;; fresh ids, but that's okay because when we go to retrieve a
 	;; fresh id, assq will always retrieve the first one.
 	(define new-literals
-	  (map (lambda (id) (cons id (new-id mac-env id)))
+	  (map (lambda (id) (cons id (mark (lookup id mac-env))))
 	       (list-ids tmpl #t (lambda (id) (not (assq id top-bindings))))))
 	(let expand ((tmpl tmpl) (bindings top-bindings))
 	  (let expand-part ((tmpl tmpl))
@@ -211,14 +202,14 @@
 		  (cons (expand-part (car tmpl)) (expand-part (cdr tmpl)))))
 	     (else tmpl)))))
 
-      (new-macro (lambda (tail env)
-		   (let loop ((rules rules))
-		     (define rule (car rules))
-		     (let ((pat (car rule)) (tmpl (cadr rule)))
-		       (define bindings (match-pattern pat tail env))
-		       (if bindings
-			   (expand-template pat tmpl bindings)
-			   (loop (cdr rules))))))))
+      (mark (lambda (tail env)
+	      (let loop ((rules rules))
+		(define rule (car rules))
+		(let ((pat (car rule)) (tmpl (cadr rule)))
+		  (define bindings (match-pattern pat tail env))
+		  (if bindings
+		      (expand-template pat tmpl bindings)
+		      (loop (cdr rules))))))))
 
     ;; We make a copy of the initial input to ensure that subsequent
     ;; mutation of it does not affect eval's result. [1]
@@ -407,6 +398,7 @@
 ;; Note: it would be fine to pass through those strings (and pairs and
 ;; vectors) that are immutable, but we can't portably detect them.
 
+
 ;; Repl provides a simple read-eval-print loop.  It semi-supports
 ;; top-level definitions and syntax definitions, but each one creates
 ;; a new binding, so if you want mutually recursive top-level
@@ -418,13 +410,10 @@
   (let repl ((env (scheme-report-environment 5)))
     (display "eiod> ")
     (let ((exp (read)))
-      (if (not (or (eof-object? exp) (equal? exp '#(stop))))
+      (if (not (eof-object? exp))
 	  (case (and (pair? exp) (car exp))
-	    ((define)
-	     (repl (eval `(let () ,exp (get-env))
-			 env)))
-	    ((define-syntax)
-	     (repl (eval `(letrec-syntax (,(cdr exp)) (get-env))
+	    ((define define-syntax)
+	     (repl (eval `(let () (define . ,(cdr exp)) (get-env))
 			 env)))
 	    (else
 	     (write (eval exp env))
