@@ -1,17 +1,27 @@
 ;; eiod.scm: eval-in-one-define
-;; $Id: eiod.scm,v 1.14 2004/09/28 01:04:24 al Exp al $
+;; $Id: eiod.scm,v 1.15 2004/09/28 06:08:10 al Exp al $
 
 ;; A minimal implementation of r5rs eval, null-environment, and
-;; scheme-report-environment.
+;; scheme-report-environment.  (And SRFI-46 extensions, too.)
 
-;; Copyright 2002 Al Petrofsky <al@petrofsky.org>
+;; Copyright 2002, 2004 Al Petrofsky <al@petrofsky.org>
 
 ;; You may redistribute and/or modify this software under the terms of
 ;; the GNU General Public License as published by the Free Software
 ;; Foundation (fsf.org); either version 2, or (at your option) any
 ;; later version.
 
-;; Data Structures:
+;; Feel free to ask me for different licensing terms. 
+
+;; DISCLAIMER: 
+
+;; This is only intended as a demonstration of the minimum
+;; implementation effort required for an r5rs eval.  It serves as a
+;; simple, working example of one way to implement the r5rs macro
+;; system (and SRFI-46) .  Among the reasons that it is ill-suited for
+;; production use is the complete lack of error-checking.
+
+;; DATA STRUCTURES:
 
 ;; An environment is a procedure that accepts any identifier and
 ;; returns a denotation.  The denotation of an unbound identifier is
@@ -161,20 +171,21 @@
 (define null-environment
   (let ()
     ;; Syntax-rules is implemented as a macro that expands into a call
-    ;; to the syntax-rules* procedure.  The arguments to syntax-rules*
-    ;; are the arguments to syntax-rules plus the current environment,
-    ;; which is captured with get-env.  Syntax-rules** is called once
-    ;; with some basics from the top-level environment: it creates and
-    ;; returns syntax-rules*.
+    ;; to the syntax-rules* procedure, which returns a transformer
+    ;; procedure.  The arguments to syntax-rules* are the arguments to
+    ;; syntax-rules plus the current environment, which is captured
+    ;; with get-env.  Syntax-rules** is called once with some basics
+    ;; from the base environment.  It creates and returns
+    ;; syntax-rules*.
     (define (syntax-rules** id? new-id denotation-of-default-ellipsis)
       (define (syntax-rules* mac-env ellipsis pat-literals rules)
         (define (pat-literal? id)     (memq id pat-literals))
 	(define (not-pat-literal? id) (not (pat-literal? id)))
 	(define (ellipsis-pair? x)    (and (pair? x) (ellipsis? (car x))))
 	(define (ellipsis? x)
-	  (and (id? x)
-	       (if ellipsis
-		   (eq? x ellipsis)
+	  (if ellipsis
+	      (eq? x ellipsis)
+	      (and (id? x)
 		   (eq? (mac-env x) denotation-of-default-ellipsis))))
 
 	;; List-ids returns a list of the non-ellipsis ids in a
@@ -193,28 +204,34 @@
     
 	;; Returns #f or an alist mapping each pattern var to a part of
 	;; the input.  Ellipsis vars are mapped to lists of parts (or
-	;; lists of lists...).
-	(define (match-pattern pat use env)
+	;; lists of lists ...).
+	(define (match-pattern pat use use-env)
 	  (call-with-current-continuation
 	    (lambda (return)
 	      (define (fail) (return #f))
 	      (let match ((pat (cdr pat)) (sexp (cdr use)) (bindings '()))
 		(define (continue-if condition) (if condition bindings (fail)))
 		(cond
-		 ((id? pat) (if (pat-literal? pat)
-				(continue-if (and (id? sexp) (eq? (mac-env pat)
-								  (env sexp))))
-				(cons (cons pat sexp) bindings)))
+		 ((id? pat)
+		  (if (pat-literal? pat)
+		      (continue-if (and (id? sexp)
+					(eq? (use-env sexp) (mac-env pat))))
+		      (cons (cons pat sexp) bindings)))
 		 ((vector? pat)
 		  (or (vector? sexp) (fail))
 		  (match (vector->list pat) (vector->list sexp) bindings))
 		 ((not (pair? pat)) (continue-if (equal? pat sexp)))
 		 ((ellipsis-pair? (cdr pat))
-		  (or (list? sexp) (fail))
-		  (let ((vars (list-ids pat #t not-pat-literal?)))
+		  (let* ((tail-len (length (cddr pat)))
+			 (sexp-len (if (list? sexp) (length sexp) (fail)))
+			 (seq-len (- sexp-len tail-len))
+			 (sexp-tail (begin (if (negative? seq-len) (fail))
+					   (list-tail sexp seq-len)))
+			 (seq (reverse (list-tail (reverse sexp) tail-len)))
+			 (vars (list-ids (car pat) #t not-pat-literal?)))
 		    (define (match1 sexp) (map cdr (match (car pat) sexp '())))
-		    (append (apply map list vars (map match1 sexp))
-			    bindings)))
+		    (append (apply map list vars (map match1 seq))
+			    (match (cddr pat) sexp-tail bindings))))
 		 ((pair? sexp) (match (car pat) (car sexp)
 				      (match (cdr pat) (cdr sexp) bindings)))
 		 (else (fail)))))))
@@ -244,18 +261,18 @@
 		(if (ellipsis-pair? (cdr tmpl))
 		    (let ((vars-to-iterate (list-ellipsis-vars (car tmpl))))
 		      (define (lookup var) (cdr (assq var bindings)))
-		      (define (expand-car . vals)
+		      (define (expand-using-vals . vals)
 			(expand (car tmpl) (map cons vars-to-iterate vals)))
-		      (append (apply map expand-car
-				     (map lookup vars-to-iterate))
-			      (expand-part (cddr tmpl))))
+		      (let ((val-lists (map lookup vars-to-iterate)))
+			(append (apply map expand-using-vals val-lists)
+				(expand-part (cddr tmpl)))))
 		    (cons (expand-part (car tmpl)) (expand-part (cdr tmpl)))))
 	       (else tmpl)))))
 
-	(lambda (use env)
+	(lambda (use use-env)
 	  (let loop ((rules rules))
 	    (let* ((rule (car rules)) (pat (car rule)) (tmpl (cadr rule)))
-	      (cond ((match-pattern pat use env) =>
+	      (cond ((match-pattern pat use use-env) =>
 		     (lambda (bindings) (expand-template pat tmpl bindings)))
 		    (else (loop (cdr rules))))))))
       syntax-rules*)
@@ -562,7 +579,10 @@
 			   ((g n :::) '((a e n :::) ...)))))
 		   (g 1 2 3))))))
 	(f ::: x y z))
-      ((x ::: 1 2 3) (y ::: 1 2 3) (z ::: 1 2 3))))))
+      ((x ::: 1 2 3) (y ::: 1 2 3) (z ::: 1 2 3)))
+     ((let-syntax ((m (syntax-rules () ((m x ... y) (y x ...)))))
+	(m 1 2 3 -))
+      -4))))
 
 ;; matching close paren for quote-and-evaluate at beginning of file.
 ) 
