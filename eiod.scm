@@ -1,6 +1,6 @@
 ;; eiod.scm: eval-in-one-define
 ;; Copyright 2002 Al Petrofsky <al@petrofsky.org>
-;; $Id: eiod-simple.scm,v 1.10 2002/06/12 23:15:22 al Exp al $
+;; $Id: eiod-simple.scm,v 1.11 2002/06/17 19:27:00 al Exp al $
 ;;
 ;; A minimal implementation of r5rs eval, null-environment, and
 ;; scheme-report-environment.
@@ -8,16 +8,18 @@
 ;; Data Structures:
 
 ;; An environment is a procedure that accepts any identifier and
-;; returns a denotation.  A denotation is either a binding, or, for
-;; unbound identifiers, it is a symbol that represents the
-;; identifier's original name.
+;; returns a denotation.  The denotation of an unbound identifier is
+;; its name (as a symbol).  A bound identifier's denotation is its
+;; binding, which is a list of the identifier's name (needed by
+;; quote), the current value, and the binding's type (keyword or
+;; variable).
 
+;; identifier:       [symbol | thunk]
 ;; denotation:       [symbol | binding]
 ;; binding:          [variable-binding | keyword-binding]
-;; variable-binding: (identifier value #f)
-;; keyword-binding:  (identifier special-form #t)
+;; variable-binding: (symbol value #f)
+;; keyword-binding:  (symbol special-form #t)
 ;; special-form:     [builtin | transformer]
-;; identifier:       [symbol | thunk]
 
 ;; A value is any arbitrary scheme value.  Special forms are either a
 ;; symbol naming a builtin, or a transformer procedure that takes two
@@ -26,14 +28,14 @@
 ;; An explicit-renaming low-level macro facility is supported, upon
 ;; which syntax-rules is implemented.  When a syntax-rules template
 ;; containing a literal identifier is transcribed, the output will
-;; contain a fresh identifier, which is an eq?-unique thunk that
-;; returns the old identifier's denotation in the environment of the
-;; macro's definition.  When one of these "renamed" identifiers is
-;; looked up in an environment that has no binding for it, the old
-;; denotation is returned.  (The thunk actually returns the old
-;; denotation wrapped inside a unique pair, which is immediately
-;; unwrapped.  This is necessary to ensure that different thunks do
-;; not compare eq?.)
+;; contain a fresh identifier, which is an eq?-unique thunk that when
+;; invoked returns the old identifier's denotation in the environment
+;; of the macro's definition.  When one of these "renamed" identifiers
+;; is looked up in an environment that has no binding for it, the
+;; thunk is invoked and the old denotation is returned.  (The thunk
+;; actually returns the old denotation wrapped inside a unique pair,
+;; which is immediately unwrapped.  This is necessary to ensure that
+;; different rename thunks of the same denotation do not compare eq?.)
 
 ;; This environment and denotation model is similar to the one
 ;; described in the 1991 paper "Macros that Work" by Clinger and Rees.
@@ -51,8 +53,10 @@
 
 
 ;; Quote-and-evaluate captures all the code into the list eiod-source
-;; so that we can feed eval to itself.  The matching close parenthesis
-;; is at the end of the file.
+;; so that we can have fun feeding eval to itself, as in
+;; ((eval `(let () ,@eiod-source repl) (scheme-report-environment 5))).
+;; [Warning: this is *very* slow].
+;; The matching close parenthesis is at the end of the file.
 
 (define-syntax quote-and-evaluate
   (syntax-rules () ((_ var . x) (begin (define var 'x) . x))))
@@ -64,17 +68,16 @@
   (define (old-den id)    (car (id)))
   (define (id? x)         (or (symbol? x) (procedure? x)))
   (define (id->sym id)    (if (symbol? id) id (den->sym (old-den id))))
-  (define (den->sym den)  (if (symbol? den) den (id->sym (car den))))
+  (define (den->sym den)  (if (symbol? den) den (car den)))
 
-  (define (empty-env id) (if (symbol? id) id (old-den id)))
-  (define (add-binding binding env)
-    (lambda (id) (if (eq? id (car binding)) binding (env id))))
-
-  (define (add-var var val env)   (add-binding (list var val #f) env))
-  (define (add-key key val env)   (add-binding (list key val #t) env))
+  (define (empty-env id)          (if (symbol? id) id (old-den id)))
+  (define (env-add env id . den)  (lambda (i) (if (eq? id i) den (env i))))
+  (define (add-var var val env)   (env-add env var (id->sym var) val #f))
+  (define (add-key key val env)   (env-add env key (id->sym key) val #t))
   (define (set-val! binding val)  (set-car! (cdr binding) val))
   (define (get-val binding)       (cadr binding))
   (define (special? binding)      (caddr binding))
+
   (define (make-builtins-env)
     (do ((specials '(lambda set! begin q def define-syntax syntax get-env)
 		   (cdr specials))
@@ -307,7 +310,7 @@
 	  (syntax-rules ()
 	    ((_) #t)
 	    ((_ test) test)
-	    ((_ test . tests) (if test (and . tests)))))
+	    ((_ test . tests) (if test (and . tests) #f))))
 	(define-syntax or
 	  (syntax-rules ()
 	    ((_) #f)
@@ -499,6 +502,7 @@
       #t)
      ((if 1 2) 2)
      ((if #f 2 3) 3)
+     ((and 1 #f 2) #f)
      ((force (delay 1)) 1)
      ((let* ((x 0) (p (delay (begin (set! x (+ x 1)) x)))) (force p) (force p))
       1)
@@ -518,6 +522,12 @@
 	x)
       2)
      ((let-syntax ((f (syntax-rules () ((_) 'x)))) (f))
+      x)
+     ((let-syntax ((f (syntax-rules ()
+			((_) (let ((x 1))
+			       (let-syntax ((f (syntax-rules () ((_) 'x))))
+				 (f)))))))
+	(f))
       x))))
 
 ;; matching close paren for quote-and-evaluate at beginning of file.
