@@ -8,21 +8,26 @@
 
 ;; An environment is a procedure that takes an identifier and returns
 ;; a binding.  A binding is either a mutable pair of an identifier and
-;; its value, or, for identifiers with no non-builtin binding, it is a
-;; symbol that represents the identifier's original name.
+;; its value, or, for identifiers with no true binding, it is a symbol
+;; that represents the identifier's original name.
 
-;; binding:    [symbol | (identifier . [value | macro])]
-;; macro:      (procedure . marker)
-;; identifier: [symbol | (binding . marker)]
+;; binding:      [symbol | (identifier . [value | special-form])]
+;; special-form: ([builtin | transformer] . marker)
+;; identifier:   [symbol | (binding . marker)]
 
-;; A value is any arbitrary scheme value.  Macros are stored in pairs
-;; whose cdr is the eq?-unique marker object.  The car is a procedure
-;; of two arguments: a macro use and the environment of the macro use.
+;; A value is any arbitrary scheme value.  Special forms are stored in
+;; pairs whose cdr is the eq?-unique marker object (this makes them
+;; distinguishable from ordinary pair values in a variable binding).
+;; The car is either a symbol naming a builtin, or a transformer
+;; procedure that takes two arguments: a macro use and the environment
+;; of the macro use.
 
 ;; When a template containing a literal identifier is expanded, the
 ;; identifier is replaced with a fresh identifier, which is a new pair
-;; containing the marker object and the binding of the old identifier
-;; in the environment of the macro.
+;; whose cdr is the marker object (which makes such identifiers
+;; distinguishable from ordinary pairs in a source-code s-expression).
+;; The car is the old identifier's binding in the environment of the
+;; macro's definition.
 
 ;; This environment and identifier model is similar to the one
 ;; described in the 1991 paper "Macros that Work" by Clinger and Rees.
@@ -52,7 +57,11 @@
 	    ((vector? sexp) (list->vector (ids->syms (vector->list sexp))))
 	    (else sexp)))
     
-    (define (empty-env id) (if (symbol? id) id (unmark id)))
+    (define (make-builtins-env)
+      (define l '(lambda quote set! syntax-rules begin builtin-define get-env))
+      (let ((alist (map cons l (map mark l))))
+	(lambda (id) (or (assq id alist) (if (symbol? id) id (unmark id))))))
+
     (define (env-add id val env)
       (define binding (cons id val))
       (lambda (i) (if (eq? id i) binding (env i))))
@@ -61,22 +70,19 @@
       (let eval-in-this-env ((sexp sexp))
 	(cond ((id? sexp) (cdr (env sexp)))
 	      ((not (spair? sexp)) sexp)
-	      (else
-	       (let ((head (car sexp)) (tail (cdr sexp)))
-		 (let ((binding (and (id? head) (env head))))
-		   (case binding
-		     ((get-env) env)
-		     ((quote)   (ids->syms (car tail)))
-		     ((begin)   (eval-begin tail env))
-		     ((lambda)  (eval-lambda tail env))
-		     ((set!)    (set-cdr! (env (car tail))
-					  (eval-in-this-env (cadr tail))))
-		     ((syntax-rules) (eval-syntax-rules tail env))
-		     (else (let ((val (and binding (cdr binding))))
-			     (if (marked? val)
-				 (eval-in-this-env ((unmark val) sexp env))
-				 (apply (eval-in-this-env head)
-					(map eval-in-this-env tail))))))))))))
+	      (else (let ((head (eval-in-this-env (car sexp)))
+			  (tail (cdr sexp)))
+		      (if (marked? head)
+			  (case (unmark head)
+			    ((get-env) env)
+			    ((quote) (ids->syms (car tail)))
+			    ((begin) (eval-begin tail env))
+			    ((lambda) (eval-lambda tail env))
+			    ((set!) (set-cdr! (env (car tail))
+					      (eval-in-this-env (cadr tail))))
+			    ((syntax-rules) (eval-syntax-rules tail env))
+			    (else (eval-in-this-env ((unmark head) sexp env))))
+			  (apply head (map eval-in-this-env tail))))))))
 
     (define (eval-begin tail env)
       ;; Don't use for-each because we must tail-call the last expression.
@@ -88,28 +94,27 @@
       (lambda args
 	(define ienv (do ((args args (cdr args))
 			  (vars (car tail) (cdr vars))
-			  (env env (env-add (car vars) (car args) env)))
+			  (ienv env (env-add (car vars) (car args) ienv)))
 			 ((not (spair? vars))
-			  (if (null? vars) env (env-add vars args env)))))
+			  (if (null? vars) ienv (env-add vars args ienv)))))
 	(let loop ((ienv ienv) (defs '()) (body (cdr tail)))
 	  (let ((first (car body)) (rest (cdr body)))
 	    (let* ((head (and (spair? first) (car first)))
-		   (binding (and (id? head) (ienv head))))
-	      (case binding
-		((begin) (loop ienv defs (append (cdr first) rest)))
-		((builtin-define) (loop (env-add (cadr first) 'undefined ienv)
-					(cons first defs)
-					rest))
-		(else
-		 (let ((val (and (pair? binding) (cdr binding))))
-		   (if (marked? val)
-		       (loop ienv defs (cons ((unmark val) first ienv) rest))
-		       (begin
-			 (for-each (lambda (var val) (set-cdr! (ienv var) val))
-				   (map cadr defs)
-				   (map (lambda (def) (xeval (caddr def) ienv))
-					defs))
-			 (eval-begin body ienv)))))))))))
+		   (head-val (and (id? head) (cdr (ienv head))))
+		   (special (and (marked? head-val) (unmark head-val))))
+	      (if (procedure? special)
+		  (loop ienv defs (cons (special first ienv) rest))
+		  (case special
+		    ((begin) (loop ienv defs (append (cdr first) rest)))
+		    ((builtin-define)
+		     (loop (env-add (cadr first) 'undefined ienv)
+			   (cons (cdr first) defs)
+			   rest))
+		    (else (for-each set-cdr!
+				    (map ienv (map car defs))
+				    (map (lambda (def) (xeval (cadr def) ienv))
+					 defs))
+			  (eval-begin body ienv)))))))))
 
     (define (eval-syntax-rules mac-tail mac-env)
       (define literals (car mac-tail))
@@ -126,16 +131,12 @@
       ;; only include ids that are within the scope of at least one
       ;; ellipsis.
       (define (list-ids x include-scalars pred?)
-	(let collect ((x x) (including include-scalars) (l '()))
-	  (cond ((vector? x) (collect (vector->list x) including l))
-		((and (id? x) including (pred? x))
-		 (cons x l))
-		((spair? x)
-		 (if (ellipsis-pair? (cdr x))
-		     (collect (car x) #t
-			      (collect (cddr x) including l))
-		     (collect (car x) including
-			      (collect (cdr x) including l))))
+	(let collect ((x x) (inc include-scalars) (l '()))
+	  (cond ((vector? x) (collect (vector->list x) inc l))
+		((id? x) (if (and inc (pred? x)) (cons x l) l))
+		((spair? x) (if (ellipsis-pair? (cdr x))
+				(collect (car x) #t (collect (cddr x) inc l))
+				(collect (car x) inc (collect (cdr x) inc l))))
 		(else l))))
     
       ;; Returns #f or an alist mapping each pattern var to a part of
@@ -220,7 +221,7 @@
 		     ((pair? x) (cons (copy (car x)) (copy (cdr x))))
 		     ((vector? x) (list->vector (copy (vector->list x))))
 		     (else x)))
-	     (or env empty-env)))))
+	     (or env (make-builtins-env))))))
 
 
 (define null-environment
@@ -241,12 +242,10 @@
 	(define-syntax do
 	  (syntax-rules ()
 	    ((_ ((var init . step) ...)
-		end-clause
-		. commands)
+		ending
+		expr ...)
 	     (let loop ((var init) ...)
-	       (cond end-clause
-		     (else (begin #f . commands)
-			   (loop (begin var . step) ...)))))))
+	       (cond ending (else expr ... (loop (begin var . step) ...)))))))
 	(define-syntax letrec
 	  (syntax-rules ()
 	    ((_ ((var init) ...) . body)
@@ -266,15 +265,13 @@
 		name)
 	      init ...))))
 	(define-syntax case
-	  (syntax-rules (else)
-	    ((_ (x . y) . clauses)
-	     (let ((key (x . y)))
-	       (case key . clauses)))
-	    ((_ key (else . exps))
-	     (begin #f . exps))
-	    ((_ key (atoms . exps) . clauses)
-	     (if (memv key 'atoms) (begin . exps) (case key . clauses)))
-	    ((_ key) #f)))
+	  (syntax-rules ()
+	    ((_ x (test . exprs) ...)
+	     (let ((key x))
+	       (cond ((case-test key test) . exprs)
+		     ...)))))
+	(define-syntax case-test
+	  (syntax-rules (else) ((_ k else) #t) ((_ k atoms) (memv k 'atoms))))
 	(define-syntax cond
 	  (syntax-rules (else =>)
 	    ((_) #f)
@@ -294,27 +291,24 @@
 	    ((_) #f)
 	    ((_ test) test)
 	    ((_ test . tests) (let ((x test)) (if x x (or . tests))))))
+	(define-syntax define
+	  (syntax-rules ()
+	    ((_ (var . args) . body)
+	     (define var (lambda args . body)))
+	    ((_ var init) (builtin-define var init))))
 	(define-syntax if
-	  (syntax-rules ()
-	    ((_ a b)   (if* a (lambda () b)))
-	    ((_ a b c) (if* a (lambda () b) (lambda () c)))))
+	  (syntax-rules () ((_ x y ...) (if* x (lambda () y) ...))))
 	(define-syntax delay
-	  (syntax-rules ()
-	    ((_ x) (delay* (lambda () x)))))))
+	  (syntax-rules () ((_ x) (delay* (lambda () x)))))))
+    (define (if* a b . c) (if a (b) (if (pair? c) ((car c)))))
     (define (delay* thunk) (delay (thunk)))
-    (define (if* a b . c) (if (null? c) (if a (b)) (if a (b) ((car c)))))
     (define (null-env)
       ((eval `(lambda (cons append list->vector memv delay* if*)
-		(builtin-define define-syntax
-		  (syntax-rules () ((_ . args) (builtin-define . args))))
-		(builtin-define define
-	          (syntax-rules ()
-		    ((_ (var . args) . body) (define var (lambda args . body)))
-		    ((_ var init) (builtin-define var init))))
-		((lambda ()
+		((lambda (define-syntax)
 		   ,@macro-defs
 		   (let ((let-syntax let) (letrec-syntax letrec))
-		     (get-env)))))
+		     (get-env)))
+		 builtin-define))
 	     #f)
        cons append list->vector memv delay* if*))
     (define promise (delay (null-env)))
@@ -328,10 +322,9 @@
   (let-syntax
       ((extend-env
 	(syntax-rules ()
-	  ((_ env name ...)
-	   ((eval '(lambda (name ...) (get-env))
-		  env)
-	    name ...)))))
+	  ((_ env . names)
+	   ((eval '(lambda names (get-env)) env)
+	    . names)))))
     (let ()
       (define (r5-env)
 	(extend-env (null-environment 5)
