@@ -1,24 +1,29 @@
 ;; eiod.scm: eval-in-one-define
-;; Copyright 2002 Al Petrofsky <al@petrofsky.org>
-;; $Id: eiod-simple.scm,v 1.11 2002/06/17 19:27:00 al Exp al $
-;;
+;; $Id: eiod-simple.scm,v 1.12 2002/06/17 23:33:17 al Exp al $
+
 ;; A minimal implementation of r5rs eval, null-environment, and
 ;; scheme-report-environment.
+
+;; Copyright 2002 Al Petrofsky <al@petrofsky.org>
+
+;; You may redistribute and/or modify this software under the terms of
+;; the GNU General Public License as published by the Free Software
+;; Foundation (fsf.org); either version 2, or (at your option) any
+;; later version.
 
 ;; Data Structures:
 
 ;; An environment is a procedure that accepts any identifier and
 ;; returns a denotation.  The denotation of an unbound identifier is
 ;; its name (as a symbol).  A bound identifier's denotation is its
-;; binding, which is a list of the identifier's name (needed by
-;; quote), the current value, and the binding's type (keyword or
-;; variable).
+;; binding, which is a list of the current value, the binding's type
+;; (keyword or variable), and the identifier's name (needed by quote).
 
 ;; identifier:       [symbol | thunk]
 ;; denotation:       [symbol | binding]
 ;; binding:          [variable-binding | keyword-binding]
-;; variable-binding: (symbol value #f)
-;; keyword-binding:  (symbol special-form #t)
+;; variable-binding: (value        #f symbol)
+;; keyword-binding:  (special-form #t symbol)
 ;; special-form:     [builtin | transformer]
 
 ;; A value is any arbitrary scheme value.  Special forms are either a
@@ -55,12 +60,11 @@
 ;; Quote-and-evaluate captures all the code into the list eiod-source
 ;; so that we can have fun feeding eval to itself, as in
 ;; ((eval `(let () ,@eiod-source repl) (scheme-report-environment 5))).
-;; [Warning: this is *very* slow].
-;; The matching close parenthesis is at the end of the file.
-
+;; [Note: using (and even starting) a doubly evaled repl will be *very* slow.]
 (define-syntax quote-and-evaluate
   (syntax-rules () ((_ var . x) (begin (define var 'x) . x))))
 
+;; The matching close parenthesis is at the end of the file.
 (quote-and-evaluate eiod-source
 
 (define (eval sexp env)
@@ -68,15 +72,17 @@
   (define (old-den id)    (car (id)))
   (define (id? x)         (or (symbol? x) (procedure? x)))
   (define (id->sym id)    (if (symbol? id) id (den->sym (old-den id))))
-  (define (den->sym den)  (if (symbol? den) den (car den)))
+  (define (den->sym den)  (if (symbol? den) den (get-sym den)))
 
   (define (empty-env id)          (if (symbol? id) id (old-den id)))
-  (define (env-add env id . den)  (lambda (i) (if (eq? id i) den (env i))))
-  (define (add-var var val env)   (env-add env var (id->sym var) val #f))
-  (define (add-key key val env)   (env-add env key (id->sym key) val #t))
-  (define (set-val! binding val)  (set-car! (cdr binding) val))
-  (define (get-val binding)       (cadr binding))
-  (define (special? binding)      (caddr binding))
+  (define (extend env id binding) (lambda (i) (if (eq? id i) binding (env i))))
+  (define (add-var var val env)   (extend env var (list val #f (id->sym var))))
+  (define (add-key key val env)   (extend env key (list val #t (id->sym key))))
+
+  (define (get-val  binding)      (car binding))
+  (define (special? binding)      (cadr binding))
+  (define (get-sym  binding)      (caddr binding))
+  (define (set-val! binding val)  (set-car! binding val))
 
   (define (make-builtins-env)
     (do ((specials '(lambda set! begin q def define-syntax syntax get-env)
