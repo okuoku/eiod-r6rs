@@ -1,5 +1,5 @@
 ;; eiod.scm: eval-in-one-define
-;; $Id: eiod-simple.scm,v 1.12 2002/06/17 23:33:17 al Exp al $
+;; $Id$
 
 ;; A minimal implementation of r5rs eval, null-environment, and
 ;; scheme-report-environment.
@@ -62,7 +62,7 @@
 ;; ((eval `(let () ,@eiod-source repl) (scheme-report-environment 5))).
 ;; [Note: using (and even starting) a doubly evaled repl will be *very* slow.]
 (define-syntax quote-and-evaluate
-  (syntax-rules () ((_ var . x) (begin (define var 'x) . x))))
+  (syntax-rules () ((quote-and-evaluate var . x) (begin (define var 'x) . x))))
 
 ;; The matching close parenthesis is at the end of the file.
 (quote-and-evaluate eiod-source
@@ -102,15 +102,22 @@
 			      ((get-env) env)
 			      ((syntax) (car tail))
 			      ((lambda) (eval-lambda tail env))
-			      ((begin) (eval-begin tail env))
+			      ((begin) (eval-seq tail env))
 			      ((set!) (set-val! (env (car tail))
 						(eval-here (cadr tail))))
 			      ((q) (let ((x (car tail)))
 				     (if (id? x) (id->sym x) x)))
 			      (else (eval-here (special sexp env)))))
-			  (apply (eval-here head) (map eval-here tail)))))))))
+			  (apply (eval-here head)
+				 (map1 eval-here tail)))))))))
 
-  (define (eval-begin tail env)
+  ;; Don't use standard map because it might not be continuationally correct.
+  (define (map1 f l)
+    (if (null? l)
+	'()
+	(cons (f (car l)) (map1 f (cdr l)))))
+
+  (define (eval-seq tail env)
     ;; Don't use for-each because we must tail-call the last expression.
     (do ((sexps tail (cdr sexps)))
 	((null? (cdr sexps)) (eval (car sexps) env))
@@ -139,7 +146,7 @@
 		       (loop ienv (cons id ids) (cons init inits) rest))))
 		  (else (let ((ieval (lambda (init) (eval init ienv))))
 			  (for-each set-val! (map ienv ids) (map ieval inits)))
-			(eval-begin body ienv)))))))))
+			(eval-seq body ienv)))))))))
 
   ;; We make a copy of the initial input to ensure that subsequent
   ;; mutation of it does not affect eval's result. [1]
@@ -356,7 +363,7 @@
   (let-syntax
       ((extend-env
 	(syntax-rules ()
-	  ((_ env . names)
+	  ((extend-env env . names)
 	   ((eval '(lambda names (get-env)) env)
 	    . names)))))
     (let ()
