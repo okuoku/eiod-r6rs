@@ -9,7 +9,7 @@
 ;; An enivronment is an alist:
 
 ;; environment: ((identifier . [value | macro]) ...)
-;; macro: (macro-marker macro-sexp macro-env)
+;; macro: (macro-marker . procedure)
 
 ;; A value is any arbitrary scheme value.  Macros are stored in lists
 ;; whose car is the eq?-unique macro-marker object.
@@ -49,14 +49,10 @@
 	    ((vector? sexp) (list->vector (ids->syms (vector->list sexp))))
 	    (else           sexp)))
 
-    (define macro-marker  (list '*macro-marker*))
-    (define (vmacro? val) (and (pair? val) (eq? macro-marker (car val))))
-
-    (define (new-macro mac-sexp mac-env)
-      (list macro-marker mac-sexp mac-env))
-
-    (define (apply-macro mac sexp env)
-      (expand-macro sexp env (cadr mac) (caddr mac)))
+    (define macro-marker     (list '*macro-marker*))
+    (define (new-macro proc) (cons macro-marker proc))
+    (define macro-proc       cdr)
+    (define (vmacro? val)    (and (pair? val) (eq? macro-marker (car val))))
 
     (define (acons key val alist) (cons (cons key val) alist))
 
@@ -66,86 +62,72 @@
 	      id
 	      (lookup (id-prev id) (id-env id)))))
 
-    ;; place the elements of a list into the first n bindings of env.
-    (define (mutate-frame env vals)
-      (do ((env env (cdr env)) (vals vals (cdr vals)))
-	  ((null? vals))
-	(set-cdr! (car env) (car vals))))
-
-    (define (eval-body body env)
-      (let loop ((ienv env) (inits '()) (body body))
-	(define (finish)
-	  (mutate-frame ienv (map (lambda (init) (xeval init ienv))
-				  inits))
-	  (eval-sequence body ienv))
-	(define s1 (car body))
-	(define rest (cdr body))
-	(if (not (and (spair? s1) (id? (car s1))))
-	    (finish)
-	    (let ((binding (lookup (car s1) ienv)))
-	      (if (symbol? binding)
-		  (case binding
-		    ((begin) (loop ienv inits (append (cdr s1) rest)))
-		    ((define) (loop (acons (cadr s1) #f ienv)
-				    (cons (caddr s1) inits)
-				    rest))
-		    (else (finish)))
-		  (let ((val (cdr binding)))
-		    (if (vmacro? val)
-			(loop ienv inits (cons (apply-macro val s1 ienv) rest))
-			(finish))))))))
-
-    (define (eval-lambda vars body env)
+    (define (eval-lambda tail env)
       (lambda args
-	(eval-body body (do ((args args (cdr args))
-			     (vars vars (cdr vars))
-			     (env env (acons (car vars) (car args) env)))
-			    ((not (spair? vars))
-			     (if (null? vars) env (acons vars args env)))))))
+	(define ienv (do ((args args (cdr args))
+			  (vars (car tail) (cdr vars))
+			  (env env (acons (car vars) (car args) env)))
+			 ((not (spair? vars))
+			  (if (null? vars) env (acons vars args env)))))
+	(let loop ((ienv ienv) (inits '()) (body (cdr tail)))
+	  (define (finish)
+	    (define (eval-ienv init) (xeval init ienv))
+	    (do ((env ienv (cdr env)) (vals (map eval-ienv inits) (cdr vals)))
+		((null? vals) (eval-begin body ienv))
+	      (set-cdr! (car env) (car vals))))
+	  (define rest (cdr body))
+	  (let retry ((sexp (car body)))
+	    (if (not (spair? sexp))
+		(finish)
+		(let ((head (car sexp)) (tail (cdr sexp)))
+		  (let ((binding (and (id? head) (lookup head ienv))))
+		    (case binding
+		      ((begin) (loop ienv inits (append tail rest)))
+		      ((define) (loop (acons (car tail) #f ienv)
+				      (cons (cadr tail) inits)
+				      rest))
+		      (else (let ((val (and (pair? binding) (cdr binding))))
+			      (if (vmacro? val)
+				  (retry ((macro-proc val) tail ienv))
+				  (finish))))))))))))
 
-    (define (eval-sequence exps env)
+    (define (eval-begin tail env)
       ;; Don't use for-each because we must tail-call the last expression.
-      (do ((exp1 (car exps) (car exps))
-	   (exps (cdr exps) (cdr exps)))
-	  ((null? exps) (xeval exp1 env))
-	(xeval exp1 env)))
-
-    (define (apply1 combo) (apply (car combo) (cdr combo)))
+      (do ((sexp1 (car tail) (car sexps))
+	   (sexps (cdr tail) (cdr sexps)))
+	  ((null? sexps) (xeval sexp1 env))
+	(xeval sexp1 env)))
 
     (define (xeval sexp env)
       (let eval-in-this-env ((sexp sexp))
-	(define (eval-combination) (apply1 (map eval-in-this-env sexp)))
 	(cond ((id? sexp) (cdr (lookup sexp env)))
 	      ((not (spair? sexp)) sexp)
-	      ((id? (car sexp))
-	       (let ((binding (lookup (car sexp) env)))
-		 (if (symbol? binding)
-		     (case binding
-		       ((get-env) env)
-		       ((quote)   (ids->syms (cadr sexp)))
-		       ((begin)   (eval-sequence (cdr sexp) env))
-		       ((lambda)  (eval-lambda (cadr sexp) (cddr sexp) env))
-		       ((set!)    (set-cdr! (lookup (cadr sexp) env)
-					    (xeval (caddr sexp) env)))
-		       ((syntax-rules) (new-macro sexp env)))
-		     (let ((val (cdr binding)))
-		       (if (vmacro? val)
-			   (eval-in-this-env (apply-macro val sexp env))
-			   (eval-combination))))))
-	      (else (eval-combination)))))
+	      (else
+	       (let ((head (car sexp)) (tail (cdr sexp)))
+		 (let ((binding (and (id? head) (lookup head env))))
+		   (case binding
+		     ((get-env) env)
+		     ((quote)   (ids->syms (car tail)))
+		     ((begin)   (eval-begin tail env))
+		     ((lambda)  (eval-lambda tail env))
+		     ((set!)    (set-cdr! (lookup (car tail) env)
+					  (eval-in-this-env (cadr tail))))
+		     ((syntax-rules) (eval-syntax-rules tail env))
+		     (else (let ((val (and binding (cdr binding))))
+			     (if (vmacro? val)
+				 (eval-in-this-env ((macro-proc val) tail env))
+				 (apply (eval-in-this-env head)
+					(map eval-in-this-env tail))))))))))))
 
-    (define (expand-macro sexp env mac-sexp mac-env)
-      (define literals (cadr mac-sexp))
-      (define rules    (cddr mac-sexp))
+    (define (eval-syntax-rules mac-tail mac-env)
+      (define literals (car mac-tail))
+      (define rules    (cdr mac-tail))
 
       (define (pat-literal? id)     (memq id literals))
       (define (not-pat-literal? id) (not (pat-literal? id)))
 
       (define (ellipsis? x)      (and (id? x) (eq? '... (lookup x mac-env))))
       (define (ellipsis-pair? x) (and (spair? x) (ellipsis? (car x))))
-
-      (define (free-id=? pat-id sexp-id)
-	(eq? (lookup pat-id mac-env) (lookup sexp-id env)))
 
       ;; List-ids returns a list of those ids in a pattern or template
       ;; for which (pred? id) is true.  If include-scalars is false, we
@@ -167,16 +149,17 @@
       ;; Returns #f or an alist mapping each pattern var to a part of
       ;; the input.  Ellipsis vars are mapped to lists of parts (or
       ;; lists of lists...).
-      (define (match-pattern pat sexp)
+      (define (match-pattern pat tail env)
 	(call-with-current-continuation
 	 (lambda (return)
 	   (define (fail) (return #f))
-	   (let match ((pat pat) (sexp sexp) (bindings '()))
+	   (let match ((pat (cdr pat)) (sexp tail) (bindings '()))
 	     (define (continue-if condition) (if condition bindings (fail)))
 	     (cond
 	      ((id? pat)
 	       (if (pat-literal? pat)
-		   (continue-if (and (id? sexp) (free-id=? pat sexp)))
+		   (continue-if (and (id? sexp) (eq? (lookup pat mac-env)
+						     (lookup sexp env))))
 		   (acons pat sexp bindings)))
 	      ((vector? pat)
 	       (or (vector? sexp) (fail))
@@ -195,7 +178,7 @@
 		      (match (cdr pat) (cdr sexp) bindings)))
 	      (else (fail)))))))
 
-      (define (expand-template pat tmpl sexp top-bindings)
+      (define (expand-template pat tmpl top-bindings)
 	(define ellipsis-vars (list-ids pat #f not-pat-literal?))
 	(define (list-ellipsis-vars subtmpl)
 	  (list-ids subtmpl #t (lambda (id) (memq id ellipsis-vars))))
@@ -228,24 +211,24 @@
 		  (cons (expand-part (car tmpl)) (expand-part (cdr tmpl)))))
 	     (else tmpl)))))
 
-      (let loop ((rules rules))
-	(define rule (car rules))
-	(let ((pat (car rule)) (tmpl (cadr rule)))
-	  (define bindings (match-pattern (cdr pat) (cdr sexp)))
-	  (if bindings
-	      (expand-template (cdr pat) tmpl (cdr sexp) bindings)
-	      (loop (cdr rules))))))
+      (new-macro (lambda (tail env)
+		   (let loop ((rules rules))
+		     (define rule (car rules))
+		     (let ((pat (car rule)) (tmpl (cadr rule)))
+		       (define bindings (match-pattern pat tail env))
+		       (if bindings
+			   (expand-template pat tmpl bindings)
+			   (loop (cdr rules))))))))
 
     ;; We make a copy of the initial input to ensure that subsequent
     ;; mutation of it does not affect eval's result. [1]
-    (define (copy x)
-      (cond ((string? x) (string-copy x))
-	    ((pair? x) (cons (copy (car x)) (copy (cdr x))))
-	    ((vector? x) (list->vector (copy (vector->list x))))
-	    (else x)))
-
-    (lambda (sexp env)
-      (xeval (copy sexp) env))))
+    (lambda (initial-sexp env)
+      (xeval (let copy ((x initial-sexp))
+	       (cond ((string? x) (string-copy x))
+		     ((pair? x) (cons (copy (car x)) (copy (cdr x))))
+		     ((vector? x) (list->vector (copy (vector->list x))))
+		     (else x)))
+	     env))))
 
 
 (define null-environment
@@ -325,25 +308,29 @@
 	    ((_ a b c) (if* a (lambda () b) (lambda () c)))))
 	(define delay
 	  (syntax-rules ()
-	    ((_ x) (delay* (lambda () x)))))))
+	    ((_ x) (delay* (lambda () x)))))
+	(define define-curried
+	  (syntax-rules ()
+	    ((_ (var . args) . body) (define-curried var (lambda args . body)))
+	    ((_ var init) (define var init))))))
     (define (delay* thunk) (delay (thunk)))
     (define (if* a b . c) (if (null? c) (if a (b)) (if a (b) ((car c)))))
     (define (null-env)
       ((eval `(lambda (cons append list->vector memv delay* if*)
 		,@macro-defs
-		(let ((letrec-syntax letrec)
-		      (let-syntax let)
-		      (define (syntax-rules ()
-				((_ (var . args) . body)
-				 (define var (lambda args . body)))
-				((_ var init) (define var init)))))
+		(let ((let-syntax let)
+		      (letrec-syntax letrec)
+		      (define define-curried))
 		  (get-env)))
 	     '())
        cons append list->vector memv delay* if*))
     (define promise (delay (null-env)))
-    (lambda (version) (force promise))))
+    (lambda (version)
+      (if (= version 5)
+          (force promise)
+          (open-input-file "sheep-herders/r^-1rs.ltx")))))
 
- 
+
 (define scheme-report-environment
   (let-syntax
       ((extend-env
@@ -396,7 +383,10 @@
 	  read read-char peek-char eof-object? char-ready?
 	  write display newline write-char))
       (define promise (delay (r5-env)))
-      (lambda (version) (force promise)))))
+      (lambda (version)
+	(if (= version 5)
+	    (force promise)
+	    (open-input-file "sheep-herders/r^-1rs.ltx"))))))
 
 ;; [1] Some claim that this is not required, and that it is compliant for
 ;;
@@ -416,6 +406,30 @@
 ;;
 ;; Note: it would be fine to pass through those strings (and pairs and
 ;; vectors) that are immutable, but we can't portably detect them.
+
+;; Repl provides a simple read-eval-print loop.  It semi-supports
+;; top-level definitions and syntax definitions, but each one creates
+;; a new binding, so if you want mutually recursive top-level
+;; procedures, you have to do it the hard way:
+;;   (define f #f)
+;;   (define (g) (f))
+;;   (set! f (lambda () (g)))
+(define (repl)
+  (let repl ((env (scheme-report-environment 5)))
+    (display "eiod> ")
+    (let ((exp (read)))
+      (if (not (or (eof-object? exp) (equal? exp '#(stop))))
+	  (case (and (pair? exp) (car exp))
+	    ((define)
+	     (repl (eval `(let () ,exp (get-env))
+			 env)))
+	    ((define-syntax)
+	     (repl (eval `(letrec-syntax (,(cdr exp)) (get-env))
+			 env)))
+	    (else
+	     (write (eval exp env))
+	     (newline)
+	     (repl env)))))))
 
 (define (tests noisy)
   (define env (scheme-report-environment 5))
