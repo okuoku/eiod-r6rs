@@ -6,22 +6,28 @@
 
 ;; Data Structures:
 
-;; An environment is an alist:
+;; An environment is a procedure that takes an identifier and returns
+;; a binding.  A binding is either a mutable pair of an identifier and
+;; its value, or, for identifiers with no non-builtin binding, it is a
+;; symbol that represents the identifier's original name.
 
-;; environment:    (proper-binding ...)
-;; proper-binding: (identifier . [value | macro])
-;; macro:          (procedure . marker)
+;; binding:    [symbol | (identifier . [value | macro])]
+;; macro:      (procedure . marker)
+;; identifier: [symbol | (binding . marker)]
 
 ;; A value is any arbitrary scheme value.  Macros are stored in pairs
-;; whose cdr is the eq?-unique marker object.
-
-;; identifier: [symbol | (binding . marker)]
-;; binding:    [symbol | proper-binding]
+;; whose cdr is the eq?-unique marker object.  The car is a procedure
+;; of two arguments: the tail of the macro call (i.e. all the
+;; arguments in the call, without the keyword of the call), and the
+;; environment of the macro call.
 
 ;; When a template containing a literal identifier is expanded, the
-;; identifier is replaced with a new pair containing the marker object
-;; and the binding of the literal in the environment of the macro (or
-;; the plain symbol if there is no binding).
+;; identifier is replaced with a fresh identifier, which is a new pair
+;; containing the marker object and the binding of the old identifier
+;; in the environment of the macro.
+
+;; This environment and identifier model is similar to the one
+;; described in the 1991 paper "Macros that Work" by Clinger and Rees.
 
 ;; Quote-and-evaluate captures all the code into the list eiod-source
 ;; so that we can feed eval to itself.  The matching close parenthesis
@@ -48,24 +54,24 @@
 	    ((vector? sexp) (list->vector (ids->syms (vector->list sexp))))
 	    (else sexp)))
     
-    (define (lookup id env)
-      (or (assq id env) (if (symbol? id) id (unmark id))))
-
-    (define (acons key val alist) (cons (cons key val) alist))
+    (define (empty-env id) (if (symbol? id) id (unmark id)))
+    (define (env-add var val env)
+      (define binding (cons var val))
+      (lambda (id) (if (eq? id var) binding (env id))))
 
     (define (xeval sexp env)
       (let eval-in-this-env ((sexp sexp))
-	(cond ((id? sexp) (cdr (lookup sexp env)))
+	(cond ((id? sexp) (cdr (env sexp)))
 	      ((not (spair? sexp)) sexp)
 	      (else
 	       (let ((head (car sexp)) (tail (cdr sexp)))
-		 (let ((binding (and (id? head) (lookup head env))))
+		 (let ((binding (and (id? head) (env head))))
 		   (case binding
 		     ((get-env) env)
 		     ((quote)   (ids->syms (car tail)))
 		     ((begin)   (eval-begin tail env))
 		     ((lambda)  (eval-lambda tail env))
-		     ((set!)    (set-cdr! (lookup (car tail) env)
+		     ((set!)    (set-cdr! (env (car tail))
 					  (eval-in-this-env (cadr tail))))
 		     ((syntax-rules) (eval-syntax-rules tail env))
 		     (else (let ((val (and binding (cdr binding))))
@@ -85,12 +91,12 @@
       (lambda args
 	(define ienv (do ((args args (cdr args))
 			  (vars (car tail) (cdr vars))
-			  (env env (acons (car vars) (car args) env)))
+			  (env env (env-add (car vars) (car args) env)))
 			 ((not (spair? vars))
-			  (if (null? vars) env (acons vars args env)))))
+			  (if (null? vars) env (env-add vars args env)))))
 	(let loop ((ienv ienv) (def-tails '()) (body (cdr tail)))
 	  (define (finish)
-	    (for-each (lambda (var val) (set-cdr! (lookup var ienv) val))
+	    (for-each (lambda (var val) (set-cdr! (ienv var) val))
 		      (map car def-tails)
 		      (map (lambda (def-tail) (xeval (cadr def-tail) ienv))
 			   def-tails))
@@ -100,10 +106,10 @@
 	    (if (not (spair? sexp))
 		(finish)
 		(let ((head (car sexp)) (tail (cdr sexp)))
-		  (let ((binding (and (id? head) (lookup head ienv))))
+		  (let ((binding (and (id? head) (ienv head))))
 		    (case binding
 		      ((begin) (loop ienv def-tails (append tail rest)))
-		      ((define) (loop (acons (car tail) #f ienv)
+		      ((define) (loop (env-add (car tail) 'undefined ienv)
 				      (cons tail def-tails)
 				      rest))
 		      (else (let ((val (and (pair? binding) (cdr binding))))
@@ -118,7 +124,7 @@
       (define (pat-literal? id)     (memq id literals))
       (define (not-pat-literal? id) (not (pat-literal? id)))
 
-      (define (ellipsis? x)      (and (id? x) (eq? '... (lookup x mac-env))))
+      (define (ellipsis? x)      (and (id? x) (eq? '... (mac-env x))))
       (define (ellipsis-pair? x) (and (spair? x) (ellipsis? (car x))))
 
       ;; List-ids returns a list of those ids in a pattern or template
@@ -150,9 +156,9 @@
 	     (cond
 	      ((id? pat)
 	       (if (pat-literal? pat)
-		   (continue-if (and (id? sexp) (eq? (lookup pat mac-env)
-						     (lookup sexp env))))
-		   (acons pat sexp bindings)))
+		   (continue-if (and (id? sexp)
+				     (eq? (mac-env pat) (env sexp))))
+		   (cons (cons pat sexp) bindings)))
 	      ((vector? pat)
 	       (or (vector? sexp) (fail))
 	       (match (vector->list pat) (vector->list sexp) bindings))
@@ -180,7 +186,7 @@
 	;; fresh ids, but that's okay because when we go to retrieve a
 	;; fresh id, assq will always retrieve the first one.
 	(define new-literals
-	  (map (lambda (id) (cons id (mark (lookup id mac-env))))
+	  (map (lambda (id) (cons id (mark (mac-env id))))
 	       (list-ids tmpl #t (lambda (id) (not (assq id top-bindings))))))
 	(let expand ((tmpl tmpl) (bindings top-bindings))
 	  (let expand-part ((tmpl tmpl))
@@ -220,7 +226,7 @@
 		     ((pair? x) (cons (copy (car x)) (copy (cdr x))))
 		     ((vector? x) (list->vector (copy (vector->list x))))
 		     (else x)))
-	     env))))
+	     (or env empty-env)))))
 
 
 (define null-environment
@@ -314,7 +320,7 @@
 		      (letrec-syntax letrec)
 		      (define define-curried))
 		  (get-env)))
-	     '())
+	     #f)
        cons append list->vector memv delay* if*))
     (define promise (delay (null-env)))
     (lambda (version)
@@ -338,7 +344,7 @@
 	  number? complex? real? rational? integer? exact? inexact?
 	  = < > <= >= zero? positive? negative? odd? even?
 	  max min + * - /
-	  abs quotient remainder modulo gcd lcm ;; numerator denominator
+	  abs quotient remainder modulo gcd lcm numerator denominator
 	  floor ceiling truncate round rationalize
 	  exp log sin cos tan asin acos atan sqrt expt
 	  make-rectangular make-polar real-part imag-part magnitude angle
@@ -402,11 +408,13 @@
 
 ;; Repl provides a simple read-eval-print loop.  It semi-supports
 ;; top-level definitions and syntax definitions, but each one creates
-;; a new binding, so if you want mutually recursive top-level
+;; a new binding whose region does not include anything that came
+;; before the definition, so if you want mutually recursive top-level
 ;; procedures, you have to do it the hard way:
 ;;   (define f #f)
 ;;   (define (g) (f))
 ;;   (set! f (lambda () (g)))
+;; Repl does not support macro uses that expand into top-level definitions.
 (define (repl)
   (let repl ((env (scheme-report-environment 5)))
     (display "eiod> ")
@@ -417,8 +425,9 @@
 	     (repl (eval `(let () (define ,@(cdr exp)) (get-env))
 			 env)))
 	    (else
-	     (write (eval exp env))
-	     (newline)
+	     (for-each (lambda (val) (write val) (newline))
+		       (call-with-values (lambda () (eval exp env))
+			 list))
 	     (repl env)))))))
 
 (define (tests noisy)
