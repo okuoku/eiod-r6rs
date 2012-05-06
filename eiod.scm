@@ -489,6 +489,14 @@
 	    (force promise)
 	    (open-input-file "sheep-herders/r^-1rs.ltx"))))))
 
+(define (root-env)
+  (define-syntax extend-env
+    (syntax-rules ()
+      ((_ env . names)
+       ((eval '(lambda names (get-env)) env) . names))))
+  (extend-env (scheme-report-environment 5)
+              repl-read))
+
 ;; [1] Some claim that this is not required, and that it is compliant for
 ;;
 ;;   (let* ((x (string #\a))
@@ -630,6 +638,7 @@
       -4))))
 
 ;; matching close paren for quote-and-evaluate at beginning of file.
-(repl)
 ) 
+
+((eval `(let () ,@eiod-source repl) (root-env)))
 
