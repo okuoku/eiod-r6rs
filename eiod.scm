@@ -1,3 +1,11 @@
+(import (rnrs)
+        (rnrs mutable-pairs)
+        (rnrs mutable-strings)
+        (except (rnrs r5rs)
+                scheme-report-environment
+                null-environment
+                ))
+
 ;; eiod.scm: eval-in-one-define
 ;; $Id: eiod.scm,v 1.16 2004/10/29 21:06:51 al Exp al $
 
@@ -436,7 +444,7 @@
 	  input-port? output-port? current-input-port current-output-port
 	  with-input-from-file with-output-to-file
 	  open-input-file open-output-file close-input-port close-output-port
-	  read read-char peek-char eof-object? char-ready?
+	  read read-char peek-char eof-object? ;char-ready?
 	  write display newline write-char))
       (define promise (delay (r5-env)))
       (lambda (version)
