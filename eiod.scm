@@ -6,6 +6,43 @@
                 null-environment
                 ))
 
+;; R6RS read helper from nmosh
+
+; from psyntax-mosh's repl
+(define (nrepl-read-one p)
+  (define (readline)
+    (get-line p))
+  (define (string->datum str)
+    (call-with-port (open-string-input-port str) read))
+  (let loop ([line (readline)]
+             [accum ""])
+    (define (parentheses-ok? text)
+      (let loop ([chars (string->list text)]
+                 [p0 0]
+                 [p1 0])
+        ;; FIXME: should reject ([)] or so..
+        (if (null? chars)
+          (= 0 p0 p1)
+          (case (car chars)
+            [(#\()
+             (loop (cdr chars) (+ p0 1) p1)]
+            [(#\))
+             (loop (cdr chars) (- p0 1) p1)]
+            [(#\[)
+             (loop (cdr chars) p0 (+ p1 1))]
+            [(#\])
+             (loop (cdr chars) p0 (- p1 1))]
+            [else
+              (loop (cdr chars) p0 p1)]))))
+    (if (eof-object? line)
+      (values (string->datum accum) #f)
+      (let ([current (string-append accum line)])
+        (if (parentheses-ok? current)
+          (values (string->datum current) #t) ; return current string
+          (loop (readline) (string-append current " ")))))))
+
+(define (repl-read) (nrepl-read-one (current-input-port)))
+
 ;; eiod.scm: eval-in-one-define
 ;; $Id: eiod.scm,v 1.16 2004/10/29 21:06:51 al Exp al $
 
@@ -433,7 +470,7 @@
 	  string=? string-ci=? string<? string>? string<=? string>=?
 	  string-ci<? string-ci>? string-ci<=? string-ci>=?
 	  substring string-append string->list list->string
-	  string-copy string-fill!
+	  string-copy ;string-fill!
 	  vector? make-vector vector vector-length vector-ref vector-set!
 	  vector->list list->vector vector-fill!
 	  procedure? apply map for-each force
@@ -484,7 +521,7 @@
 (define (repl)
   (let repl ((env (scheme-report-environment 5)))
     (display "eiod> ")
-    (let ((exp (read)))
+    (let ((exp (repl-read)))
       (if (not (eof-object? exp))
 	  (case (and (pair? exp) (car exp))
 	    ((define define-syntax) (repl (eval `(let () ,exp (get-env))
@@ -593,5 +630,6 @@
       -4))))
 
 ;; matching close paren for quote-and-evaluate at beginning of file.
+(repl)
 ) 
 
